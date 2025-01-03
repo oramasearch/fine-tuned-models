@@ -73,6 +73,7 @@ You need to generate some examples in the following format:
 Reply with the generated query in a valid JSON format only. Nothing else.
 """
 
+
 class OllamaProvider:
     def __init__(self, model_name: str = "qwen2.5:14b"):
         self.JSONL_FILE = "synthetic_data.jsonl"
@@ -91,21 +92,26 @@ class OllamaProvider:
             model=self.model_name,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"Generate 10 example datasets. The theme for these questions must be: {topic}."},
+                {
+                    "role": "user",
+                    "content": f"Generate 10 example datasets. The theme for these questions must be: {topic}.",
+                },
             ],
         )
         return repair_json(response.choices[0].message.content)
 
     def save(self, data):
         try:
-            with open(self.JSONL_FILE, 'a', encoding='utf-8') as file:
+            with open(self.JSONL_FILE, "a", encoding="utf-8") as file:
                 for obj in data:
-                    file.write(json.dumps(obj, ensure_ascii=False) + '\n')
+                    file.write(json.dumps(obj, ensure_ascii=False) + "\n")
         except Exception as e:
             print(f"An error occurred while appending to the file: {e}")
 
     def to_csv(self):
-        with open(self.JSONL_FILE, 'r') as jsonl, open(self.CSV_FILE, 'w', newline='', encoding='utf-8') as csv_out:
+        with open(self.JSONL_FILE, "r") as jsonl, open(
+            self.CSV_FILE, "w", newline="", encoding="utf-8"
+        ) as csv_out:
             fieldnames = set()
             records = []
 
@@ -116,12 +122,18 @@ class OllamaProvider:
 
             fieldnames = sorted(fieldnames)
 
-            writer = csv.DictWriter(csv_out, fieldnames=fieldnames, quoting=csv.QUOTE_MINIMAL)
+            writer = csv.DictWriter(
+                csv_out, fieldnames=fieldnames, quoting=csv.QUOTE_MINIMAL
+            )
             writer.writeheader()
 
             for record in records:
-                formatted_record = {key: (json.dumps(value) if isinstance(value, (dict, list)) else value)
-                                    for key, value in record.items()}
+                formatted_record = {
+                    key: (
+                        json.dumps(value) if isinstance(value, (dict, list)) else value
+                    )
+                    for key, value in record.items()
+                }
                 writer.writerow(formatted_record)
 
         print(f"Converted {self.JSONL_FILE} to {self.CSV_FILE} successfully.")
@@ -132,11 +144,14 @@ def process_topic(topic, provider: OllamaProvider = OllamaProvider()):
     print(json.dumps(json_data, indent=2))
     provider.save(json_data)
 
+
 if __name__ == "__main__":
     provider = OllamaProvider()
 
     with ThreadPoolExecutor(max_workers=4) as executor:
-        future_to_topic = {executor.submit(process_topic, topic, provider): topic for topic in TOPICS}
+        future_to_topic = {
+            executor.submit(process_topic, topic, provider): topic for topic in TOPICS
+        }
 
         for future in as_completed(future_to_topic):
             topic = future_to_topic[future]

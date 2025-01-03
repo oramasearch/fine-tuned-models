@@ -4,14 +4,9 @@ from transformers import (
     AutoTokenizer,
     TrainingArguments,
     Trainer,
-    BitsAndBytesConfig
+    BitsAndBytesConfig,
 )
-from peft import (
-    LoraConfig,
-    get_peft_model,
-    prepare_model_for_kbit_training,
-    TaskType
-)
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
 import json
 import wandb
 
@@ -53,56 +48,61 @@ The rules to generate the query are:
 
 
 def prepare_dataset(data_path, tokenizer):
-    dataset = load_dataset('json', data_files=data_path, split='train')
+    dataset = load_dataset("json", data_files=data_path, split="train")
 
     def format_instruction(example):
         try:
-            instruction = "Generate an Orama search query based on the user's request and schema"
-            query = example.get('query', '').strip()
+            instruction = (
+                "Generate an Orama search query based on the user's request and schema"
+            )
+            query = example.get("query", "").strip()
 
-            schema = example.get('schema', '{}')
+            schema = example.get("schema", "{}")
             schema = json.loads(schema) if isinstance(schema, str) else schema
 
-            generated_query = example.get('generatedQuery', '{}')
-            generated_query = json.loads(generated_query) if isinstance(generated_query, str) else generated_query
+            generated_query = example.get("generatedQuery", "{}")
+            generated_query = (
+                json.loads(generated_query)
+                if isinstance(generated_query, str)
+                else generated_query
+            )
 
             schema_str = json.dumps(schema, indent=2)
             generated_query_str = json.dumps(generated_query, indent=2)
 
-            formatted_text = (f"### System: {SYSTEM_PROMPT}\n\n"
-                              f"### Instruction: {instruction}\n\n"
-                              f"### Input: Query: {query}\nSchema: {schema_str}\n\n"
-                              f"### Response: {generated_query_str}")
+            formatted_text = (
+                f"### System: {SYSTEM_PROMPT}\n\n"
+                f"### Instruction: {instruction}\n\n"
+                f"### Input: Query: {query}\nSchema: {schema_str}\n\n"
+                f"### Response: {generated_query_str}"
+            )
 
-            tokenized = tokenizer(formatted_text,
-                                  truncation=True,
-                                  max_length=2048,
-                                  padding='max_length',
-                                  return_tensors='pt')
+            tokenized = tokenizer(
+                formatted_text,
+                truncation=True,
+                max_length=2048,
+                padding="max_length",
+                return_tensors="pt",
+            )
 
             return {
-                'input_ids': tokenized['input_ids'].squeeze().tolist(),
-                'attention_mask': tokenized['attention_mask'].squeeze().tolist(),
-                'labels': tokenized['input_ids'].squeeze().tolist()
+                "input_ids": tokenized["input_ids"].squeeze().tolist(),
+                "attention_mask": tokenized["attention_mask"].squeeze().tolist(),
+                "labels": tokenized["input_ids"].squeeze().tolist(),
             }
 
         except (json.JSONDecodeError, TypeError, KeyError) as e:
             print(f"Error processing example: {e}")
-            return {
-                'input_ids': [],
-                'attention_mask': [],
-                'labels': []
-            }
+            return {"input_ids": [], "attention_mask": [], "labels": []}
 
     dataset = dataset.map(
         format_instruction,
         remove_columns=dataset.column_names,
-        desc="Formatting dataset"
+        desc="Formatting dataset",
     )
 
     dataset = dataset.filter(
-        lambda x: len(x['input_ids']) > 0,
-        desc="Filtering empty examples"
+        lambda x: len(x["input_ids"]) > 0, desc="Filtering empty examples"
     )
 
     print(f"Dataset size after filtering: {len(dataset)}")
@@ -116,7 +116,7 @@ def setup_peft_model(model):
         r=64,
         lora_alpha=16,
         lora_dropout=0.1,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
     )
 
     model = prepare_model_for_kbit_training(model)
@@ -132,8 +132,8 @@ def train_model(data_path: str, model_name: str):
 
     dataset = prepare_dataset(data_path, tokenizer)
     train_test_split = dataset.train_test_split(test_size=0.1)
-    train_dataset = train_test_split['train']
-    eval_dataset = train_test_split['test']
+    train_dataset = train_test_split["train"]
+    eval_dataset = train_test_split["test"]
 
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -146,7 +146,7 @@ def train_model(data_path: str, model_name: str):
         model_name,
         quantization_config=bnb_config,
         device_map="auto",
-        trust_remote_code=True
+        trust_remote_code=True,
     )
 
     model = setup_peft_model(model)
@@ -167,7 +167,7 @@ def train_model(data_path: str, model_name: str):
         gradient_checkpointing=True,
         optim="paged_adamw_32bit",
         max_grad_norm=0.3,
-        remove_unused_columns=False
+        remove_unused_columns=False,
     )
 
     wandb.init(
@@ -175,8 +175,8 @@ def train_model(data_path: str, model_name: str):
         config={
             "learning_rate": training_args.learning_rate,
             "batch_size": training_args.per_device_train_batch_size,
-            "epochs": training_args.num_train_epochs
-        }
+            "epochs": training_args.num_train_epochs,
+        },
     )
 
     trainer = Trainer(
@@ -184,22 +184,20 @@ def train_model(data_path: str, model_name: str):
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        data_collator=None
+        data_collator=None,
     )
 
     trainer.train()
     trainer.save_model()
 
+
 def evaluate_model(model, tokenizer, prompt):
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     outputs = model.generate(
-        **inputs,
-        max_length=100,
-        temperature=0.7,
-        top_p=0.9,
-        num_return_sequences=1
+        **inputs, max_length=100, temperature=0.7, top_p=0.9, num_return_sequences=1
     )
     return tokenizer.decode(outputs[0], skip_special_tokens=True)
+
 
 if __name__ == "__main__":
     model_name = "NousResearch/Nous-Hermes-llama-2-7b"
