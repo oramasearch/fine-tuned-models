@@ -1,0 +1,13 @@
+openai
+json-repair
+torch
+torchvision
+torchaudio
+transformers
+datasets
+accelerate
+bitsandbytes
+wandb
+sentencepiece
+peft
+bitsandbytes
