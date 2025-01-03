@@ -4,7 +4,6 @@ from transformers import (
     AutoTokenizer,
     TrainingArguments,
     Trainer,
-    DataCollatorForLanguageModeling,
     BitsAndBytesConfig
 )
 from peft import (
@@ -53,7 +52,7 @@ The rules to generate the query are:
 """
 
 
-def prepare_dataset(data_path):
+def prepare_dataset(data_path, tokenizer):
     dataset = load_dataset('json', data_files=data_path, split='train')
 
     def format_instruction(example):
@@ -70,22 +69,45 @@ def prepare_dataset(data_path):
             schema_str = json.dumps(schema, indent=2)
             generated_query_str = json.dumps(generated_query, indent=2)
 
+            formatted_text = (f"### System: {SYSTEM_PROMPT}\n\n"
+                              f"### Instruction: {instruction}\n\n"
+                              f"### Input: Query: {query}\nSchema: {schema_str}\n\n"
+                              f"### Response: {generated_query_str}")
+
+            tokenized = tokenizer(formatted_text,
+                                  truncation=True,
+                                  max_length=2048,
+                                  padding='max_length',
+                                  return_tensors='pt')
+
             return {
-                'text': f"### System: {SYSTEM_PROMPT}\n\n"
-                        f"### Instruction: {instruction}\n\n"
-                        f"### Input: Query: {query}\nSchema: {schema_str}\n\n"
-                        f"### Response: {generated_query_str}"
+                'input_ids': tokenized['input_ids'].squeeze().tolist(),
+                'attention_mask': tokenized['attention_mask'].squeeze().tolist(),
+                'labels': tokenized['input_ids'].squeeze().tolist()
             }
+
         except (json.JSONDecodeError, TypeError, KeyError) as e:
             print(f"Error processing example: {e}")
-            return {'text': ''}
+            return {
+                'input_ids': [],
+                'attention_mask': [],
+                'labels': []
+            }
 
-    dataset = dataset.map(format_instruction)
-    dataset = dataset.filter(lambda x: x['text'] != '')
+    dataset = dataset.map(
+        format_instruction,
+        remove_columns=dataset.column_names,
+        desc="Formatting dataset"
+    )
+
+    dataset = dataset.filter(
+        lambda x: len(x['input_ids']) > 0,
+        desc="Filtering empty examples"
+    )
 
     print(f"Dataset size after filtering: {len(dataset)}")
-
     return dataset
+
 
 def setup_peft_model(model):
     peft_config = LoraConfig(
@@ -102,32 +124,33 @@ def setup_peft_model(model):
 
     return model
 
+
 def train_model(data_path: str, model_name: str):
-    dataset = prepare_dataset(data_path)
-    train_test_split = dataset.train_test_split(test_size=0.1)
-    train_dataset = train_test_split['train']
-    eval_dataset = train_test_split['test']
-    
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
-    
+
+    dataset = prepare_dataset(data_path, tokenizer)
+    train_test_split = dataset.train_test_split(test_size=0.1)
+    train_dataset = train_test_split['train']
+    eval_dataset = train_test_split['test']
+
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype="float16",
         bnb_4bit_use_double_quant=True,
     )
-    
+
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         quantization_config=bnb_config,
         device_map="auto",
         trust_remote_code=True
     )
-    
+
     model = setup_peft_model(model)
-    
+
     training_args = TrainingArguments(
         output_dir="./llama-finetuned",
         num_train_epochs=3,
@@ -143,9 +166,10 @@ def train_model(data_path: str, model_name: str):
         fp16=True,
         gradient_checkpointing=True,
         optim="paged_adamw_32bit",
-        max_grad_norm=0.3
+        max_grad_norm=0.3,
+        remove_unused_columns=False
     )
-    
+
     wandb.init(
         project="llama-finetuning",
         config={
@@ -154,15 +178,15 @@ def train_model(data_path: str, model_name: str):
             "epochs": training_args.num_train_epochs
         }
     )
-    
+
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False)
+        data_collator=None
     )
-    
+
     trainer.train()
     trainer.save_model()
 

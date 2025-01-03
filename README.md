@@ -17,8 +17,13 @@ Then install all the dependencies:
 pip install -r requirements.txt
 ```
 
-You can generate synthetic data with thr `synthetic.py` file always included with every model. It depends on either a local or remote Ollama installation for generating synthetic data via Qwen2.5 14B.
+You can generate synthetic data with the `synthetic.py` file always included with every model. It depends on either a local or remote Ollama installation for generating synthetic data via Qwen2.5 14B.
+
+```shell
+cd models/query-translator
+OLLAMA_URL=http://localhost:11434 python synthetic.py
+```
 
 ## License
 
-Private. Do not share outside of Orama.
+Private. Do not share outside Orama.
