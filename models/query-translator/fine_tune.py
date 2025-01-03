@@ -9,6 +9,7 @@ from transformers import (
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
 import json
 import wandb
+import torch
 
 SYSTEM_PROMPT = """
 You are a tool used to generate synthetic data of Orama queries. Orama is a full-text, vector, and hybrid search engine.
@@ -52,14 +53,9 @@ def prepare_dataset(data_path, tokenizer):
 
     def format_instruction(example):
         try:
-            instruction = (
-                "Generate an Orama search query based on the user's request and schema"
-            )
             query = example.get("query", "").strip()
-
             schema = example.get("schema", "{}")
             schema = json.loads(schema) if isinstance(schema, str) else schema
-
             generated_query = example.get("generatedQuery", "{}")
             generated_query = (
                 json.loads(generated_query)
@@ -67,20 +63,24 @@ def prepare_dataset(data_path, tokenizer):
                 else generated_query
             )
 
-            schema_str = json.dumps(schema, indent=2)
-            generated_query_str = json.dumps(generated_query, indent=2)
+            schema_str = json.dumps(schema)
+            generated_query_str = json.dumps(generated_query)
 
-            formatted_text = (
-                f"### System: {SYSTEM_PROMPT}\n\n"
-                f"### Instruction: {instruction}\n\n"
-                f"### Input: Query: {query}\nSchema: {schema_str}\n\n"
-                f"### Response: {generated_query_str}"
+            # Format using Qwen2's chat template
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": f"Query: {query}\nSchema: {schema_str}"},
+                {"role": "assistant", "content": generated_query_str},
+            ]
+
+            formatted_text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
             )
 
             tokenized = tokenizer(
                 formatted_text,
                 truncation=True,
-                max_length=2048,
+                max_length=1024,
                 padding="max_length",
                 return_tensors="pt",
             )
@@ -113,22 +113,30 @@ def setup_peft_model(model):
     peft_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         inference_mode=False,
-        r=64,
-        lora_alpha=16,
+        r=16,
+        lora_alpha=32,
         lora_dropout=0.1,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        target_modules=[
+            "self_attn.q_proj",
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+            "self_attn.o_proj",
+            "mlp.gate_proj",
+            "mlp.up_proj",
+            "mlp.down_proj",
+        ],
+        bias="none",
     )
 
     model = prepare_model_for_kbit_training(model)
     model = get_peft_model(model, peft_config)
-
     return model
 
 
 def train_model(data_path: str, model_name: str):
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name, trust_remote_code=True, padding_side="right"
+    )
 
     dataset = prepare_dataset(data_path, tokenizer)
     train_test_split = dataset.train_test_split(test_size=0.1)
@@ -138,7 +146,7 @@ def train_model(data_path: str, model_name: str):
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype="float16",
+        bnb_4bit_compute_dtype=torch.float16,
         bnb_4bit_use_double_quant=True,
     )
 
@@ -152,12 +160,12 @@ def train_model(data_path: str, model_name: str):
     model = setup_peft_model(model)
 
     training_args = TrainingArguments(
-        output_dir="./llama-2-7b-query-translator",
+        output_dir="./query-translator-mini",
         num_train_epochs=3,
         per_device_train_batch_size=2,
         gradient_accumulation_steps=8,
-        learning_rate=2e-5,
-        warmup_steps=100,
+        learning_rate=5e-5,
+        warmup_steps=50,
         logging_steps=10,
         save_steps=100,
         eval_steps=100,
@@ -171,7 +179,7 @@ def train_model(data_path: str, model_name: str):
     )
 
     wandb.init(
-        project="llama-2-7b-query-translator",
+        project="query-translator-mini",
         config={
             "learning_rate": training_args.learning_rate,
             "batch_size": training_args.per_device_train_batch_size,
@@ -191,6 +199,37 @@ def train_model(data_path: str, model_name: str):
     trainer.save_model()
 
 
+def generate_query(model, tokenizer, query, schema):
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": f"Query: {query}\nSchema: {json.dumps(schema)}"},
+    ]
+
+    prompt = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    outputs = model.generate(
+        **inputs,
+        max_length=512,
+        temperature=0.1,  # Lower temperature for more deterministic outputs
+        top_p=0.9,
+        num_return_sequences=1,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+    )
+
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    try:
+        response = response.split("<|assistant|>")[-1].strip()
+        response = response.split("<|")[0].strip()
+        return json.loads(response)
+    except Exception as e:
+        print(f"Error parsing response: {e}")
+        return None
+
+
 def evaluate_model(model, tokenizer, prompt):
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     outputs = model.generate(
@@ -200,6 +239,6 @@ def evaluate_model(model, tokenizer, prompt):
 
 
 if __name__ == "__main__":
-    model_name = "NousResearch/Nous-Hermes-llama-2-7b"
+    model_name = "Qwen/Qwen2.5-7B"
     data_path = "./synthetic_data.jsonl"
     train_model(data_path, model_name)

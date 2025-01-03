@@ -65,25 +65,8 @@ def update_model(base_model_name: str, adapter_path: str, repo_name: str, token:
 
 
 if __name__ == "__main__":
-    BASE_MODEL = "NousResearch/Nous-Hermes-llama-2-7b"
-    ADAPTER_PATH = "./llama-2-7b-query-translator"
-    REPO_NAME = "OramaSearch/query-translator-mini"
-
-    token = input(
-        "Enter your HuggingFace token (from https://huggingface.co/settings/tokens): "
-    )
-
-    update_model(
-        base_model_name=BASE_MODEL,
-        adapter_path=ADAPTER_PATH,
-        repo_name=REPO_NAME,
-        token=token,
-    )
-
-
-if __name__ == "__main__":
-    BASE_MODEL = "NousResearch/Nous-Hermes-llama-2-7b"
-    ADAPTER_PATH = "./llama-2-7b-query-translator"
+    BASE_MODEL = "Qwen/Qwen2.5-7B"
+    ADAPTER_PATH = "./query-translator-mini"
     REPO_NAME = "OramaSearch/query-translator-mini"
 
     token = input(

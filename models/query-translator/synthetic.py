@@ -9,6 +9,8 @@ TOPICS = [
     "computer science",
     "javascript",
     "react",
+    "php",
+    "java",
     "music",
     "programming",
     "groceries",
@@ -23,6 +25,18 @@ TOPICS = [
     "entertainment",
     "lifestyle",
     "fashion",
+    "movies",
+    "gaming",
+    "hardware",
+    "animals",
+    "vacation",
+    "hotels",
+    "astronomy",
+    "food",
+    "technology",
+    "medical",
+    "outdoor activities",
+    "family",
 ]
 
 SYSTEM_PROMPT = """
@@ -80,33 +94,38 @@ class OllamaProvider:
         self.CSV_FILE = "synthetic_data.csv"
         self.OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/v1")
         self.OLLAMA_KEY = os.getenv("OLLAMA_KEY", "placeholder-not-used")
-
         self.model_name = model_name
         self.client = OpenAI(
             base_url=self.OLLAMA_URL,
             api_key=self.OLLAMA_KEY,
         )
 
-    def generate(self, topic: str):
+    def generate(self, topic: str, batch_num: int):
+        print(f"Generating dataset {batch_num}/10 for {topic}...")
         response = self.client.chat.completions.create(
             model=self.model_name,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {
                     "role": "user",
-                    "content": f"Generate 10 example datasets. The theme for these questions must be: {topic}.",
+                    "content": f"Generate 10 example datasets. The theme for these questions and schema must be: {topic}.",
                 },
             ],
         )
+        print(f"Completed dataset {batch_num}/10 for {topic}")
         return repair_json(response.choices[0].message.content)
 
     def save(self, data):
+        if not self.validate_data(data):
+            print("Invalid data structure, skipping save")
+            return
+
         try:
             with open(self.JSONL_FILE, "a", encoding="utf-8") as file:
                 for obj in data:
                     file.write(json.dumps(obj, ensure_ascii=False) + "\n")
         except Exception as e:
-            print(f"An error occurred while appending to the file: {e}")
+            print(f"Error appending to file: {e}")
 
     def to_csv(self):
         with open(self.JSONL_FILE, "r") as jsonl, open(
@@ -138,24 +157,36 @@ class OllamaProvider:
 
         print(f"Converted {self.JSONL_FILE} to {self.CSV_FILE} successfully.")
 
+    def validate_entry(self, entry):
+        required_fields = ["query", "schema", "generatedQuery"]
+        return all(isinstance(entry.get(field), str) for field in required_fields)
 
-def process_topic(topic, provider: OllamaProvider = OllamaProvider()):
-    json_data = json.loads(provider.generate(topic))
-    print(json.dumps(json_data, indent=2))
+    def validate_data(self, data):
+        if not isinstance(data, list):
+            return False
+        return all(
+            isinstance(entry, dict) and self.validate_entry(entry) for entry in data
+        )
+
+
+def process_topic(topic, batch_num: int, provider: OllamaProvider = OllamaProvider()):
+    json_data = json.loads(provider.generate(topic, batch_num))
     provider.save(json_data)
 
 
 if __name__ == "__main__":
     provider = OllamaProvider()
 
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        future_to_topic = {
-            executor.submit(process_topic, topic, provider): topic for topic in TOPICS
-        }
+    for batch_num in range(1, 11):
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            future_to_topic = {
+                executor.submit(process_topic, topic, batch_num, provider): topic
+                for topic in TOPICS
+            }
 
-        for future in as_completed(future_to_topic):
-            topic = future_to_topic[future]
-            try:
-                future.result()
-            except Exception as e:
-                print(f"An error occurred while processing topic '{topic}': {e}")
+            for future in as_completed(future_to_topic):
+                topic = future_to_topic[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"Error processing '{topic}' in batch {batch_num}: {e}")

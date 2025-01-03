@@ -160,8 +160,8 @@ def validate_orama_query(query):
 
 
 def main():
-    base_model_name = "NousResearch/Nous-Hermes-llama-2-7b"
-    adapter_path = "./llama-2-7b-query-translator"
+    base_model_name = "Qwen/Qwen2.5-7B"
+    adapter_path = "./query-translator-mini"
 
     model, tokenizer = load_model(base_model_name, adapter_path)
 
