@@ -152,7 +152,7 @@ def train_model(data_path: str, model_name: str):
     model = setup_peft_model(model)
 
     training_args = TrainingArguments(
-        output_dir="./llama-finetuned",
+        output_dir="./llama-2-7b-query-translator",
         num_train_epochs=3,
         per_device_train_batch_size=2,
         gradient_accumulation_steps=8,
@@ -171,7 +171,7 @@ def train_model(data_path: str, model_name: str):
     )
 
     wandb.init(
-        project="llama-finetuning",
+        project="llama-2-7b-query-translator",
         config={
             "learning_rate": training_args.learning_rate,
             "batch_size": training_args.per_device_train_batch_size,
