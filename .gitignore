@@ -3,3 +3,4 @@ oftm_env
 wandb
 __pycache__
 llama-2-7b-query-translator/
+merged_model

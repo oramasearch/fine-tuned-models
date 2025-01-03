@@ -11,3 +11,4 @@ wandb
 sentencepiece
 peft
 bitsandbytes
+huggingface_hub
