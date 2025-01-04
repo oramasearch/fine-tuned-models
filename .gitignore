@@ -6,4 +6,4 @@ llama-2-7b-query-translator/
 merged_model
 synthetic_data.json
 synthetic_data.jsonl
-qwen2-query-translator/
+query-translator-mini

@@ -5,6 +5,7 @@ from fine_tune import SYSTEM_PROMPT
 import torch
 import json
 import time
+import os
 
 
 def load_model(base_model_name, adapter_path):
@@ -173,6 +174,9 @@ def main():
     }
 
     print("\nOrama Query Generator")
+    print("-------------------")
+    print("Model directory size:")
+    print(f"{os.path.getsize('query-translator-mini') / 1024 / 1024:.2f} MB")
     print("-------------------")
     print(f"Default schema: {json.dumps(default_schema, indent=2)}")
 
