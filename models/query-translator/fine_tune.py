@@ -208,16 +208,26 @@ def setup_peft_model(model, config: TrainingConfig):
 
 
 class CustomTrainer(Trainer):
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(
+        self, model, inputs, return_outputs=False, num_items_in_batch=None
+    ):
         outputs = model(**inputs)
         loss = outputs.loss
 
-        # Add regularization to prevent overfitting
-        l2_lambda = 0.01 if self.args.weight_decay > 0.03 else 0.005
-        l2_reg = torch.tensor(0.0, requires_grad=True)
-        for param in model.parameters():
-            l2_reg = l2_reg + torch.norm(param, 2)
-        loss = loss + l2_lambda * l2_reg
+        if self.args.weight_decay > 0:
+            l2_lambda = 0.01 if self.args.weight_decay > 0.03 else 0.005
+            l2_reg = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
+
+            for param in model.parameters():
+                if param.requires_grad and param.dtype in [
+                    torch.float16,
+                    torch.float32,
+                    torch.bfloat16,
+                ]:
+                    param_float = param.float()
+                    l2_reg = l2_reg + torch.norm(param_float, p=2).to(loss.dtype)
+
+            loss = loss + l2_lambda * l2_reg
 
         return (loss, outputs) if return_outputs else loss
 
