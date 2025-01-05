@@ -1,15 +1,20 @@
-from datasets import load_dataset
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     TrainingArguments,
     Trainer,
     BitsAndBytesConfig,
+    DataCollatorForLanguageModeling,
 )
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
-import json
 import wandb
 import torch
+from torch.cuda import get_device_properties
+from dataclasses import dataclass
+from datasets import load_dataset
+import json
+from typing import Dict, Any
+import os
 
 SYSTEM_PROMPT = """
 You are a tool used to generate synthetic data of Orama queries. Orama is a full-text, vector, and hybrid search engine.
@@ -48,74 +53,142 @@ The rules to generate the query are:
 """
 
 
-def prepare_dataset(data_path, tokenizer):
-    dataset = load_dataset("json", data_files=data_path, split="train")
+@dataclass
+class HardwareConfig:
+    device_name: str
+    total_memory: int  # in GB
+    is_production: bool
+    cuda_cores: int
 
-    def format_instruction(example):
-        try:
-            query = example.get("query", "").strip()
-            schema = example.get("schema", "{}")
-            schema = json.loads(schema) if isinstance(schema, str) else schema
-            generated_query = example.get("generatedQuery", "{}")
-            generated_query = (
-                json.loads(generated_query)
-                if isinstance(generated_query, str)
-                else generated_query
-            )
 
-            schema_str = json.dumps(schema)
-            generated_query_str = json.dumps(generated_query)
+class TrainingConfig:
+    def __init__(self, hardware: HardwareConfig):
+        self.hardware = hardware
+        self.is_production = hardware.is_production
 
-            # Format using Qwen2's chat template
-            messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"Query: {query}\nSchema: {schema_str}"},
-                {"role": "assistant", "content": generated_query_str},
-            ]
+    @property
+    def batch_size(self) -> int:
+        if self.is_production:
+            # Adapted for production usage on one or more H100.
+            return 8
+        # Smaller batch size for local development on a 4080 Super.
+        return 2
 
-            formatted_text = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
+    @property
+    def gradient_accumulation_steps(self) -> int:
+        if self.is_production:
+            return 4
+        return 16
 
-            tokenized = tokenizer(
-                formatted_text,
-                truncation=True,
-                max_length=1024,
-                padding="max_length",
-                return_tensors="pt",
-            )
+    @property
+    def sequence_length(self) -> int:
+        if self.is_production:
+            return 2048
+        return 1024
 
+    @property
+    def lora_config(self) -> dict:
+        if self.is_production:
             return {
-                "input_ids": tokenized["input_ids"].squeeze().tolist(),
-                "attention_mask": tokenized["attention_mask"].squeeze().tolist(),
-                "labels": tokenized["input_ids"].squeeze().tolist(),
+                "r": 32,
+                "lora_alpha": 64,
+                "lora_dropout": 0.05,
+            }
+        return {
+            "r": 16,
+            "lora_alpha": 32,
+            "lora_dropout": 0.1,
+        }
+
+    @property
+    def training_args(self) -> dict:
+        base_args = {
+            "output_dir": "./query-translator-mini",
+            "evaluation_strategy": "steps",
+            "load_best_model_at_end": True,
+            "save_total_limit": 3,
+            "gradient_checkpointing": True,
+            "remove_unused_columns": False,
+            "report_to": "wandb",
+            "ddp_find_unused_parameters": False,
+        }
+
+        if self.is_production:
+            return {
+                **base_args,
+                "num_train_epochs": 5,
+                "per_device_train_batch_size": self.batch_size,
+                "per_device_eval_batch_size": self.batch_size,
+                "gradient_accumulation_steps": self.gradient_accumulation_steps,
+                "learning_rate": 1e-4,
+                "weight_decay": 0.05,
+                "warmup_ratio": 0.1,
+                "bf16": True,
+                "fp16": False,
+                "optim": "adamw_torch_fused",
+                "max_grad_norm": 0.5,
+            }
+        else:
+            return {
+                **base_args,
+                "num_train_epochs": 3,
+                "per_device_train_batch_size": self.batch_size,
+                "per_device_eval_batch_size": self.batch_size,
+                "gradient_accumulation_steps": self.gradient_accumulation_steps,
+                "learning_rate": 5e-5,
+                "weight_decay": 0.01,
+                "warmup_ratio": 0.05,
+                "fp16": True,
+                "optim": "adamw_8bit",
+                "max_grad_norm": 0.3,
             }
 
-        except (json.JSONDecodeError, TypeError, KeyError) as e:
-            print(f"Error processing example: {e}")
-            return {"input_ids": [], "attention_mask": [], "labels": []}
+    @property
+    def quantization_config(self) -> BitsAndBytesConfig:
+        base_config = {
+            "load_in_4bit": True,
+            "bnb_4bit_quant_type": "nf4",
+            "bnb_4bit_use_double_quant": True,
+        }
 
-    dataset = dataset.map(
-        format_instruction,
-        remove_columns=dataset.column_names,
-        desc="Formatting dataset",
+        if self.is_production:
+            return BitsAndBytesConfig(
+                **base_config,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+            )
+        return BitsAndBytesConfig(
+            **base_config,
+            bnb_4bit_compute_dtype=torch.float16,
+        )
+
+
+def detect_hardware() -> HardwareConfig:
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA device not available")
+
+    device = torch.cuda.current_device()
+    props = get_device_properties(device)
+    total_memory = props.total_memory / (1024**3)
+
+    # Detect if we're in production (H100) based on memory and environment variable
+    is_production = (
+        total_memory > 50  # H100 has ~80GB
+        or os.getenv("PRODUCTION_ENVIRONMENT") == "1"
     )
 
-    dataset = dataset.filter(
-        lambda x: len(x["input_ids"]) > 0, desc="Filtering empty examples"
+    return HardwareConfig(
+        device_name=props.name,
+        total_memory=total_memory,
+        is_production=is_production,
+        cuda_cores=props.multi_processor_count,
     )
 
-    print(f"Dataset size after filtering: {len(dataset)}")
-    return dataset
 
-
-def setup_peft_model(model):
+def setup_peft_model(model, config: TrainingConfig):
     peft_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         inference_mode=False,
-        r=16,
-        lora_alpha=32,
-        lora_dropout=0.1,
+        **config.lora_config,
         target_modules=[
             "self_attn.q_proj",
             "self_attn.k_proj",
@@ -126,6 +199,7 @@ def setup_peft_model(model):
             "mlp.down_proj",
         ],
         bias="none",
+        modules_to_save=["embed_tokens", "lm_head"] if config.is_production else None,
     )
 
     model = prepare_model_for_kbit_training(model)
@@ -133,109 +207,283 @@ def setup_peft_model(model):
     return model
 
 
+class CustomTrainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False):
+        outputs = model(**inputs)
+        loss = outputs.loss
+
+        # Add regularization to prevent overfitting
+        l2_lambda = 0.01 if self.args.weight_decay > 0.03 else 0.005
+        l2_reg = torch.tensor(0.0, requires_grad=True)
+        for param in model.parameters():
+            l2_reg = l2_reg + torch.norm(param, 2)
+        loss = loss + l2_lambda * l2_reg
+
+        return (loss, outputs) if return_outputs else loss
+
+
+def prepare_dataset(data_path: str, tokenizer, config: TrainingConfig):
+    dataset = load_dataset("json", data_files=data_path, split="train")
+
+    def format_instruction(example: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            query = example.get("query", "").strip()
+            if not query:
+                return None
+
+            schema = example.get("schema", "{}")
+            if isinstance(schema, str):
+                schema = json.loads(schema)
+
+            generated_query = example.get("generatedQuery", "{}")
+            if isinstance(generated_query, str):
+                generated_query = json.loads(generated_query)
+
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": f"Query: {query}\nSchema: {json.dumps(schema)}",
+                },
+                {"role": "assistant", "content": json.dumps(generated_query)},
+            ]
+
+            formatted_text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+
+            tokenized = tokenizer(
+                formatted_text,
+                truncation=True,
+                max_length=config.sequence_length,
+                padding="max_length",
+                return_tensors="pt",
+            )
+
+            return {
+                "input_ids": tokenized["input_ids"].squeeze().tolist(),
+                "attention_mask": tokenized["attention_mask"].squeeze().tolist(),
+                "labels": tokenized["input_ids"].squeeze().tolist(),
+            }
+
+        except (json.JSONDecodeError, ValueError, KeyError, AttributeError) as e:
+            print(f"Error processing example: {str(e)}")
+            return None
+        except Exception as e:
+            print(f"Unexpected error processing example: {str(e)}")
+            return None
+
+    num_proc = 8 if config.is_production else 4
+
+    processed_dataset = dataset.map(
+        format_instruction,
+        remove_columns=dataset.column_names,
+        num_proc=num_proc,
+        desc="Formatting dataset",
+        load_from_cache_file=not config.is_production,
+    )
+
+    def validate_example(example):
+        if example is None:
+            return False
+
+        if len(example["input_ids"]) < 10:
+            return False
+
+        if len(example["input_ids"]) > config.sequence_length:
+            return False
+
+        if len(example["input_ids"]) != len(example["attention_mask"]):
+            return False
+
+        return True
+
+    filtered_dataset = processed_dataset.filter(
+        validate_example, num_proc=num_proc, desc="Validating examples"
+    )
+
+    total_examples = len(dataset)
+    filtered_examples = len(filtered_dataset)
+    print(f"Dataset processing complete:")
+    print(f"  - Total examples: {total_examples}")
+    print(f"  - Valid examples: {filtered_examples}")
+    print(f"  - Filtered out: {total_examples - filtered_examples} examples")
+
+    return filtered_dataset
+
+
+def prepare_dataset(data_path: str, tokenizer, config: TrainingConfig):
+    dataset = load_dataset("json", data_files=data_path, split="train")
+
+    def format_instruction(example: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            query = example.get("query", "").strip()
+            if not query:
+                return {"input_ids": [], "attention_mask": [], "labels": []}
+
+            schema = example.get("schema", "{}")
+            if isinstance(schema, str):
+                try:
+                    schema = json.loads(schema)
+                except json.JSONDecodeError:
+                    schema = {}
+
+            generated_query = example.get("generatedQuery", "{}")
+            if isinstance(generated_query, str):
+                try:
+                    generated_query = json.loads(generated_query)
+                except json.JSONDecodeError:
+                    generated_query = {}
+
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": f"Query: {query}\nSchema: {json.dumps(schema)}",
+                },
+                {"role": "assistant", "content": json.dumps(generated_query)},
+            ]
+
+            formatted_text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+
+            tokenized = tokenizer(
+                formatted_text,
+                truncation=True,
+                max_length=config.sequence_length,
+                padding="max_length",
+                return_tensors="pt",
+            )
+
+            input_ids = tokenized["input_ids"].squeeze().tolist()
+            attention_mask = tokenized["attention_mask"].squeeze().tolist()
+
+            if not isinstance(input_ids, list):
+                input_ids = [input_ids]
+            if not isinstance(attention_mask, list):
+                attention_mask = [attention_mask]
+
+            return {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "labels": input_ids.copy(),  # Use copy to avoid reference issues
+            }
+
+        except Exception as e:
+            print(f"Error processing example: {str(e)}")
+            return {
+                "input_ids": [0] * config.sequence_length,
+                "attention_mask": [0] * config.sequence_length,
+                "labels": [-100] * config.sequence_length,
+            }
+
+    processed_dataset = dataset.map(
+        format_instruction,
+        remove_columns=dataset.column_names,
+        num_proc=4 if config.is_production else 2,
+        desc="Formatting dataset",
+        load_from_cache_file=not config.is_production,
+    )
+
+    def validate_example(example):
+        try:
+            required_keys = {"input_ids", "attention_mask", "labels"}
+            if not all(k in example for k in required_keys):
+                return False
+
+            lengths = {len(example[k]) for k in required_keys}
+            if len(lengths) != 1 or 0 in lengths:
+                return False
+
+            if sum(example["attention_mask"]) == 0:
+                return False
+
+            return True
+        except Exception:
+            return False
+
+    filtered_dataset = processed_dataset.filter(
+        validate_example,
+        num_proc=1,
+        desc="Validating examples",
+    )
+
+    total_examples = len(dataset)
+    filtered_examples = len(filtered_dataset)
+    print(f"Dataset processing complete:")
+    print(f"  - Total examples: {total_examples}")
+    print(f"  - Valid examples: {filtered_examples}")
+    print(f"  - Filtered out: {total_examples - filtered_examples} examples")
+
+    if filtered_examples == 0:
+        raise ValueError("No valid examples remained after filtering!")
+
+    return filtered_dataset
+
+
 def train_model(data_path: str, model_name: str):
+    hardware = detect_hardware()
+    config = TrainingConfig(hardware)
+
+    print(
+        f"Training on {hardware.device_name} with {hardware.total_memory:.1f}GB memory"
+    )
+    print(f"Production mode: {config.is_production}")
+
     tokenizer = AutoTokenizer.from_pretrained(
         model_name, trust_remote_code=True, padding_side="right"
     )
 
-    dataset = prepare_dataset(data_path, tokenizer)
-    train_test_split = dataset.train_test_split(test_size=0.1)
-    train_dataset = train_test_split["train"]
-    eval_dataset = train_test_split["test"]
-
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16,
-        bnb_4bit_use_double_quant=True,
-    )
+    dataset = prepare_dataset(data_path, tokenizer, config)
+    train_test_split = dataset.train_test_split(test_size=0.1, seed=42)
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        quantization_config=bnb_config,
+        quantization_config=config.quantization_config,
         device_map="auto",
         trust_remote_code=True,
+        torch_dtype=torch.bfloat16 if config.is_production else torch.float16,
     )
 
-    model = setup_peft_model(model)
-
-    training_args = TrainingArguments(
-        output_dir="./query-translator-mini",
-        num_train_epochs=3,
-        per_device_train_batch_size=2,
-        gradient_accumulation_steps=8,
-        learning_rate=5e-5,
-        warmup_steps=50,
-        logging_steps=10,
-        save_steps=100,
-        eval_steps=100,
-        evaluation_strategy="steps",
-        load_best_model_at_end=True,
-        fp16=True,
-        gradient_checkpointing=True,
-        optim="paged_adamw_32bit",
-        max_grad_norm=0.3,
-        remove_unused_columns=False,
-    )
+    model = setup_peft_model(model, config)
+    training_args = TrainingArguments(**config.training_args)
 
     wandb.init(
         project="query-translator-mini",
+        name=f"{'prod' if config.is_production else 'dev'}-{wandb.util.generate_id()}",
         config={
-            "learning_rate": training_args.learning_rate,
-            "batch_size": training_args.per_device_train_batch_size,
-            "epochs": training_args.num_train_epochs,
+            "model_name": model_name,
+            "hardware": hardware.device_name,
+            "memory_gb": hardware.total_memory,
+            "is_production": config.is_production,
+            **config.training_args,
         },
     )
 
-    trainer = Trainer(
+    data_collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer,
+        mlm=False,
+        pad_to_multiple_of=8 if config.is_production else 4,
+    )
+
+    trainer = CustomTrainer(
         model=model,
         args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        data_collator=None,
+        train_dataset=train_test_split["train"],
+        eval_dataset=train_test_split["test"],
+        data_collator=data_collator,
     )
 
     trainer.train()
-    trainer.save_model()
 
+    save_kwargs = {
+        "max_shard_size": "500MB" if config.is_production else "2GB",
+        "safe_serialization": True,
+    }
 
-def generate_query(model, tokenizer, query, schema):
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"Query: {query}\nSchema: {json.dumps(schema)}"},
-    ]
-
-    prompt = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    outputs = model.generate(
-        **inputs,
-        max_length=512,
-        temperature=0.1,  # Lower temperature for more deterministic outputs
-        top_p=0.9,
-        num_return_sequences=1,
-        pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-    )
-
-    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    try:
-        response = response.split("<|assistant|>")[-1].strip()
-        response = response.split("<|")[0].strip()
-        return json.loads(response)
-    except Exception as e:
-        print(f"Error parsing response: {e}")
-        return None
-
-
-def evaluate_model(model, tokenizer, prompt):
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    outputs = model.generate(
-        **inputs, max_length=100, temperature=0.7, top_p=0.9, num_return_sequences=1
-    )
-    return tokenizer.decode(outputs[0], skip_special_tokens=True)
+    model.save_pretrained("final_model", **save_kwargs)
+    tokenizer.save_pretrained("final_model")
 
 
 if __name__ == "__main__":

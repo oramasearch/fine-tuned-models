@@ -1,6 +1,7 @@
 import os
 import json
 import csv
+from typing import List
 from openai import OpenAI
 from json_repair import repair_json
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -174,8 +175,64 @@ def process_topic(topic, batch_num: int, provider: OllamaProvider = OllamaProvid
     provider.save(json_data)
 
 
+def validate_schema(schema) -> bool:
+    types = [
+        "string",
+        "string[]",
+        "number",
+        "number[]",
+        "geopoint",
+        "boolean",
+        "boolean[]",
+        "enum",
+        "enum[]",
+    ]
+
+    def check_properties(obj):
+        if isinstance(obj, dict):
+            for value in obj.values():
+                if isinstance(value, dict):
+                    if not check_properties(value):
+                        return False
+                else:
+                    if value not in types:
+                        return False
+        return True
+
+    try:
+        json_data = json.loads(schema)
+        return check_properties(json_data)
+    except json.JSONDecodeError:
+        return False
+
+
+def filter_valid_jsonl(filename: str) -> List[dict]:
+    valid_entries = []
+
+    with open(filename, "r") as file:
+        for line in file:
+            try:
+                entry = json.loads(line.strip())
+                schema = entry["schema"]
+                if validate_schema(schema):
+                    valid_entries.append(entry)
+            except (json.JSONDecodeError, KeyError):
+                continue
+
+    return valid_entries
+
+
+def save_filtered_jsonl(entries: List[dict], output_filename: str):
+    with open(output_filename, "w") as file:
+        for entry in entries:
+            file.write(json.dumps(entry) + "\n")
+
+
 if __name__ == "__main__":
     provider = OllamaProvider()
+
+    valid_entries = filter_valid_jsonl(provider.JSONL_FILE)
+    save_filtered_jsonl(valid_entries, provider.JSONL_FILE)
 
     for batch_num in range(1, 11):
         with ThreadPoolExecutor(max_workers=4) as executor:
