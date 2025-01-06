@@ -231,9 +231,6 @@ def save_filtered_jsonl(entries: List[dict], output_filename: str):
 if __name__ == "__main__":
     provider = OllamaProvider()
 
-    valid_entries = filter_valid_jsonl(provider.JSONL_FILE)
-    save_filtered_jsonl(valid_entries, provider.JSONL_FILE)
-
     for batch_num in range(1, 11):
         with ThreadPoolExecutor(max_workers=4) as executor:
             future_to_topic = {
@@ -247,3 +244,6 @@ if __name__ == "__main__":
                     future.result()
                 except Exception as e:
                     print(f"Error processing '{topic}' in batch {batch_num}: {e}")
+
+    valid_entries = filter_valid_jsonl(provider.JSONL_FILE)
+    save_filtered_jsonl(valid_entries, provider.JSONL_FILE)
