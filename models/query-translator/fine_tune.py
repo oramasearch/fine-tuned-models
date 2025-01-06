@@ -15,7 +15,9 @@ from peft import (
     TaskType,
 )
 from dataclasses import dataclass
-import torch, json, yaml
+import torch, json, yaml, os, types
+
+OPTIMIZER_NAME = "optimizer.pt"
 
 SYSTEM_PROMPT = """
 You are a tool used to generate synthetic data of Orama queries. Orama is a full-text, vector, and hybrid search engine.
@@ -228,10 +230,23 @@ def prepare_training_args(config: Config):
         eval_strategy="steps",
         eval_steps=config.eval_steps,
         save_strategy="steps",
-        save_steps=config.save_steps,
+        save_steps=50,  # Increased from 10 to 50
         gradient_checkpointing=True,
         load_best_model_at_end=True,
         max_steps=config.max_steps,
+        save_total_limit=3,
+    )
+
+
+def _save_checkpoint(trainer, output_dir):
+    trainer.model.save_pretrained(output_dir, max_shard_size="2GB")
+    if trainer.tokenizer is not None:
+        trainer.tokenizer.save_pretrained(output_dir)
+    torch.save(
+        trainer.optimizer.state_dict(),
+        os.path.join(output_dir, OPTIMIZER_NAME),
+        _use_new_zipfile_serialization=False,
+        pickle_protocol=4,
     )
 
 
@@ -258,6 +273,7 @@ def train():
         data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False),
     )
 
+    trainer._save_checkpoint = types.MethodType(_save_checkpoint, trainer)
     trainer.train()
     model = optimize_for_inference(model)
     model.save_pretrained("query-translator-mini-optimized", max_shard_size="2GB")
