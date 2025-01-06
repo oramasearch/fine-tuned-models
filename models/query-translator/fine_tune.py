@@ -255,16 +255,19 @@ def prepare_dataset(data_path: str, tokenizer, config: TrainingConfig):
         try:
             query = example.get("query", "").strip()
             if not query:
-                return None
-
+                return {"input_ids": [], "attention_mask": [], "labels": []}
             schema = example.get("schema", "{}")
             if isinstance(schema, str):
-                schema = json.loads(schema)
-
+                try:
+                    schema = json.loads(schema)
+                except json.JSONDecodeError:
+                    schema = {}
             generated_query = example.get("generatedQuery", "{}")
             if isinstance(generated_query, str):
-                generated_query = json.loads(generated_query)
-
+                try:
+                    generated_query = json.loads(generated_query)
+                except json.JSONDecodeError:
+                    generated_query = {}
             messages = [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {
@@ -273,11 +276,9 @@ def prepare_dataset(data_path: str, tokenizer, config: TrainingConfig):
                 },
                 {"role": "assistant", "content": json.dumps(generated_query)},
             ]
-
             formatted_text = tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
             )
-
             tokenized = tokenizer(
                 formatted_text,
                 truncation=True,
@@ -285,29 +286,61 @@ def prepare_dataset(data_path: str, tokenizer, config: TrainingConfig):
                 padding="max_length",
                 return_tensors="pt",
             )
-
+            input_ids = tokenized["input_ids"].squeeze().tolist()
+            attention_mask = tokenized["attention_mask"].squeeze().tolist()
+            if not isinstance(input_ids, list):
+                input_ids = [input_ids]
+            if not isinstance(attention_mask, list):
+                attention_mask = [attention_mask]
             return {
-                "input_ids": tokenized["input_ids"].squeeze().tolist(),
-                "attention_mask": tokenized["attention_mask"].squeeze().tolist(),
-                "labels": tokenized["input_ids"].squeeze().tolist(),
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "labels": input_ids.copy(),  # Use copy to avoid reference issues
             }
-
-        except (json.JSONDecodeError, ValueError, KeyError, AttributeError) as e:
-            print(f"Error processing example: {str(e)}")
-            return None
         except Exception as e:
-            print(f"Unexpected error processing example: {str(e)}")
-            return None
-
-    num_proc = 16 if config.is_production else 4
+            print(f"Error processing example: {str(e)}")
+            return {
+                "input_ids": [0] * config.sequence_length,
+                "attention_mask": [0] * config.sequence_length,
+                "labels": [-100] * config.sequence_length,
+            }
 
     processed_dataset = dataset.map(
         format_instruction,
         remove_columns=dataset.column_names,
-        num_proc=num_proc,
+        num_proc=4 if config.is_production else 2,
         desc="Formatting dataset",
         load_from_cache_file=not config.is_production,
     )
+
+    def validate_example(example):
+        try:
+            required_keys = {"input_ids", "attention_mask", "labels"}
+            if not all(k in example for k in required_keys):
+                return False
+            lengths = {len(example[k]) for k in required_keys}
+            if len(lengths) != 1 or 0 in lengths:
+                return False
+            if sum(example["attention_mask"]) == 0:
+                return False
+            return True
+        except Exception:
+            return False
+
+    filtered_dataset = processed_dataset.filter(
+        validate_example,
+        num_proc=1,
+        desc="Validating examples",
+    )
+    total_examples = len(dataset)
+    filtered_examples = len(filtered_dataset)
+    print(f"Dataset processing complete:")
+    print(f"  - Total examples: {total_examples}")
+    print(f"  - Valid examples: {filtered_examples}")
+    print(f"  - Filtered out: {total_examples - filtered_examples} examples")
+    if filtered_examples == 0:
+        raise ValueError("No valid examples remained after filtering!")
+    return filtered_dataset
 
     def validate_example(example):
         if example is None:
