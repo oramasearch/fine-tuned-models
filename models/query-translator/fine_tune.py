@@ -76,7 +76,7 @@ class TrainingConfig:
     def batch_size(self) -> int:
         if self.is_production:
             # Adapted for production usage on one or more H100.
-            return 16
+            return 8
         # Smaller batch size for local development on a 4080 Super.
         return 2
 
@@ -393,6 +393,7 @@ def train_model(data_path: str, model_name: str):
         device_map="auto",
         trust_remote_code=True,
         torch_dtype=torch.bfloat16 if config.is_production else torch.float16,
+        use_gradient_checkpointing=True,
     )
 
     model = setup_peft_model(model, config)
