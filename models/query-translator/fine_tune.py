@@ -6,7 +6,13 @@ from transformers import (
     BitsAndBytesConfig,
     DataCollatorForLanguageModeling,
 )
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
+from peft import (
+    LoraConfig,
+    get_peft_model,
+    prepare_model_for_kbit_training,
+    TaskType,
+    PeftModel,
+)
 import wandb
 import torch
 from torch.cuda import get_device_properties
@@ -70,14 +76,14 @@ class TrainingConfig:
     def batch_size(self) -> int:
         if self.is_production:
             # Adapted for production usage on one or more H100.
-            return 8
+            return 16
         # Smaller batch size for local development on a 4080 Super.
         return 2
 
     @property
     def gradient_accumulation_steps(self) -> int:
         if self.is_production:
-            return 4
+            return 8
         return 16
 
     @property
@@ -90,9 +96,9 @@ class TrainingConfig:
     def lora_config(self) -> dict:
         if self.is_production:
             return {
-                "r": 32,
-                "lora_alpha": 64,
-                "lora_dropout": 0.05,
+                "r": 64,
+                "lora_alpha": 128,
+                "lora_dropout": 0.1,
             }
         return {
             "r": 16,
@@ -120,13 +126,16 @@ class TrainingConfig:
                 "per_device_train_batch_size": self.batch_size,
                 "per_device_eval_batch_size": self.batch_size,
                 "gradient_accumulation_steps": self.gradient_accumulation_steps,
-                "learning_rate": 1e-4,
-                "weight_decay": 0.05,
-                "warmup_ratio": 0.1,
+                "learning_rate": 2e-4,
+                "weight_decay": 0.1,
+                "warmup_ratio": 0.15,
                 "bf16": True,
                 "fp16": False,
                 "optim": "adamw_torch_fused",
                 "max_grad_norm": 0.5,
+                "eval_steps": 50,
+                "save_steps": 50,
+                "logging_steps": 10,
             }
         else:
             return {
@@ -160,6 +169,13 @@ class TrainingConfig:
             **base_config,
             bnb_4bit_compute_dtype=torch.float16,
         )
+
+
+def prune_model(model: PeftModel, threshold: float = 0.1):
+    for name, module in model.named_modules():
+        if hasattr(module, "weight") and module.weight is not None:
+            mask = torch.abs(module.weight) > threshold
+            module.weight.data *= mask
 
 
 def detect_hardware() -> HardwareConfig:
@@ -283,7 +299,7 @@ def prepare_dataset(data_path: str, tokenizer, config: TrainingConfig):
             print(f"Unexpected error processing example: {str(e)}")
             return None
 
-    num_proc = 8 if config.is_production else 4
+    num_proc = 16 if config.is_production else 4
 
     processed_dataset = dataset.map(
         format_instruction,
@@ -318,116 +334,6 @@ def prepare_dataset(data_path: str, tokenizer, config: TrainingConfig):
     print(f"  - Total examples: {total_examples}")
     print(f"  - Valid examples: {filtered_examples}")
     print(f"  - Filtered out: {total_examples - filtered_examples} examples")
-
-    return filtered_dataset
-
-
-def prepare_dataset(data_path: str, tokenizer, config: TrainingConfig):
-    dataset = load_dataset("json", data_files=data_path, split="train")
-
-    def format_instruction(example: Dict[str, Any]) -> Dict[str, Any]:
-        try:
-            query = example.get("query", "").strip()
-            if not query:
-                return {"input_ids": [], "attention_mask": [], "labels": []}
-
-            schema = example.get("schema", "{}")
-            if isinstance(schema, str):
-                try:
-                    schema = json.loads(schema)
-                except json.JSONDecodeError:
-                    schema = {}
-
-            generated_query = example.get("generatedQuery", "{}")
-            if isinstance(generated_query, str):
-                try:
-                    generated_query = json.loads(generated_query)
-                except json.JSONDecodeError:
-                    generated_query = {}
-
-            messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": f"Query: {query}\nSchema: {json.dumps(schema)}",
-                },
-                {"role": "assistant", "content": json.dumps(generated_query)},
-            ]
-
-            formatted_text = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-
-            tokenized = tokenizer(
-                formatted_text,
-                truncation=True,
-                max_length=config.sequence_length,
-                padding="max_length",
-                return_tensors="pt",
-            )
-
-            input_ids = tokenized["input_ids"].squeeze().tolist()
-            attention_mask = tokenized["attention_mask"].squeeze().tolist()
-
-            if not isinstance(input_ids, list):
-                input_ids = [input_ids]
-            if not isinstance(attention_mask, list):
-                attention_mask = [attention_mask]
-
-            return {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "labels": input_ids.copy(),  # Use copy to avoid reference issues
-            }
-
-        except Exception as e:
-            print(f"Error processing example: {str(e)}")
-            return {
-                "input_ids": [0] * config.sequence_length,
-                "attention_mask": [0] * config.sequence_length,
-                "labels": [-100] * config.sequence_length,
-            }
-
-    processed_dataset = dataset.map(
-        format_instruction,
-        remove_columns=dataset.column_names,
-        num_proc=4 if config.is_production else 2,
-        desc="Formatting dataset",
-        load_from_cache_file=not config.is_production,
-    )
-
-    def validate_example(example):
-        try:
-            required_keys = {"input_ids", "attention_mask", "labels"}
-            if not all(k in example for k in required_keys):
-                return False
-
-            lengths = {len(example[k]) for k in required_keys}
-            if len(lengths) != 1 or 0 in lengths:
-                return False
-
-            if sum(example["attention_mask"]) == 0:
-                return False
-
-            return True
-        except Exception:
-            return False
-
-    filtered_dataset = processed_dataset.filter(
-        validate_example,
-        num_proc=1,
-        desc="Validating examples",
-    )
-
-    total_examples = len(dataset)
-    filtered_examples = len(filtered_dataset)
-    print(f"Dataset processing complete:")
-    print(f"  - Total examples: {total_examples}")
-    print(f"  - Valid examples: {filtered_examples}")
-    print(f"  - Filtered out: {total_examples - filtered_examples} examples")
-
-    if filtered_examples == 0:
-        raise ValueError("No valid examples remained after filtering!")
 
     return filtered_dataset
 
@@ -492,8 +398,8 @@ def train_model(data_path: str, model_name: str):
         "safe_serialization": True,
     }
 
-    model.save_pretrained("final_model", **save_kwargs)
-    tokenizer.save_pretrained("final_model")
+    prune_model(model, threshold=0.1)
+    model.save_pretrained("final_model_pruned", **save_kwargs)
 
 
 if __name__ == "__main__":
