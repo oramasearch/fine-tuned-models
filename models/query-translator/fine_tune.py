@@ -1,26 +1,22 @@
+from datasets import load_dataset
+from typing import Dict, Any
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     TrainingArguments,
+    DataCollatorForLanguageModeling,
     Trainer,
     BitsAndBytesConfig,
-    DataCollatorForLanguageModeling,
 )
 from peft import (
     LoraConfig,
     get_peft_model,
     prepare_model_for_kbit_training,
     TaskType,
-    PeftModel,
 )
-import wandb
 import torch
-from torch.cuda import get_device_properties
 from dataclasses import dataclass
-from datasets import load_dataset
 import json
-from typing import Dict, Any
-import os
 
 SYSTEM_PROMPT = """
 You are a tool used to generate synthetic data of Orama queries. Orama is a full-text, vector, and hybrid search engine.
@@ -60,195 +56,19 @@ The rules to generate the query are:
 
 
 @dataclass
-class HardwareConfig:
-    device_name: str
-    total_memory: int  # in GB
-    is_production: bool
-    cuda_cores: int
+class OptimizedConfig:
+    sequence_length: int = 512
+    batch_size: int = 4
+    gradient_accumulation_steps: int = 4
+    lora_r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.1
+    learning_rate: float = 3e-4
+    num_train_epochs: int = 1
+    warmup_ratio: float = 0.05
 
 
-class TrainingConfig:
-    def __init__(self, hardware: HardwareConfig):
-        self.hardware = hardware
-        self.is_production = hardware.is_production
-
-    @property
-    def batch_size(self) -> int:
-        if self.is_production:
-            # Adapted for production usage on one or more H100.
-            return 8
-        # Smaller batch size for local development on a 4080 Super.
-        return 2
-
-    @property
-    def gradient_accumulation_steps(self) -> int:
-        if self.is_production:
-            return 8
-        return 16
-
-    @property
-    def sequence_length(self) -> int:
-        if self.is_production:
-            return 2048
-        return 1024
-
-    @property
-    def lora_config(self) -> dict:
-        if self.is_production:
-            return {
-                "r": 64,
-                "lora_alpha": 128,
-                "lora_dropout": 0.1,
-            }
-        return {
-            "r": 16,
-            "lora_alpha": 32,
-            "lora_dropout": 0.1,
-        }
-
-    @property
-    def training_args(self) -> dict:
-        base_args = {
-            "output_dir": "./query-translator-mini",
-            "evaluation_strategy": "steps",
-            "load_best_model_at_end": True,
-            "save_total_limit": 3,
-            "gradient_checkpointing": True,
-            "remove_unused_columns": False,
-            "report_to": "wandb",
-            "ddp_find_unused_parameters": False,
-        }
-
-        if self.is_production:
-            return {
-                **base_args,
-                "num_train_epochs": 5,
-                "per_device_train_batch_size": self.batch_size,
-                "per_device_eval_batch_size": self.batch_size,
-                "gradient_accumulation_steps": self.gradient_accumulation_steps,
-                "learning_rate": 2e-4,
-                "weight_decay": 0.1,
-                "warmup_ratio": 0.15,
-                "bf16": True,
-                "fp16": False,
-                "optim": "adamw_torch_fused",
-                "max_grad_norm": 0.5,
-                "eval_steps": 50,
-                "save_steps": 50,
-                "logging_steps": 10,
-            }
-        else:
-            return {
-                **base_args,
-                "num_train_epochs": 3,
-                "per_device_train_batch_size": self.batch_size,
-                "per_device_eval_batch_size": self.batch_size,
-                "gradient_accumulation_steps": self.gradient_accumulation_steps,
-                "learning_rate": 5e-5,
-                "weight_decay": 0.01,
-                "warmup_ratio": 0.05,
-                "fp16": True,
-                "optim": "adamw_8bit",
-                "max_grad_norm": 0.3,
-            }
-
-    @property
-    def quantization_config(self) -> BitsAndBytesConfig:
-        base_config = {
-            "load_in_4bit": True,
-            "bnb_4bit_quant_type": "nf4",
-            "bnb_4bit_use_double_quant": True,
-        }
-
-        if self.is_production:
-            return BitsAndBytesConfig(
-                **base_config,
-                bnb_4bit_compute_dtype=torch.bfloat16,
-            )
-        return BitsAndBytesConfig(
-            **base_config,
-            bnb_4bit_compute_dtype=torch.float16,
-        )
-
-
-def prune_model(model: PeftModel, threshold: float = 0.1):
-    for name, module in model.named_modules():
-        if hasattr(module, "weight") and module.weight is not None:
-            mask = torch.abs(module.weight) > threshold
-            module.weight.data *= mask
-
-
-def detect_hardware() -> HardwareConfig:
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA device not available")
-
-    device = torch.cuda.current_device()
-    props = get_device_properties(device)
-    total_memory = props.total_memory / (1024**3)
-
-    # Detect if we're in production (H100) based on memory and environment variable
-    is_production = (
-        total_memory > 50  # H100 has ~80GB
-        or os.getenv("PRODUCTION_ENVIRONMENT") == "1"
-    )
-
-    return HardwareConfig(
-        device_name=props.name,
-        total_memory=total_memory,
-        is_production=is_production,
-        cuda_cores=props.multi_processor_count,
-    )
-
-
-def setup_peft_model(model, config: TrainingConfig):
-    peft_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        inference_mode=False,
-        **config.lora_config,
-        target_modules=[
-            "self_attn.q_proj",
-            "self_attn.k_proj",
-            "self_attn.v_proj",
-            "self_attn.o_proj",
-            "mlp.gate_proj",
-            "mlp.up_proj",
-            "mlp.down_proj",
-        ],
-        bias="none",
-        modules_to_save=["embed_tokens", "lm_head"] if config.is_production else None,
-    )
-
-    model = prepare_model_for_kbit_training(model)
-    model = get_peft_model(model, peft_config)
-    return model
-
-
-class CustomTrainer(Trainer):
-    def compute_loss(
-        self, model, inputs, return_outputs=False, num_items_in_batch=None
-    ):
-        outputs = model(**inputs)
-        loss = outputs.loss
-
-        if self.args.weight_decay > 0:
-            l2_lambda = 0.01 if self.args.weight_decay > 0.03 else 0.005
-            l2_reg = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
-
-            for param in model.parameters():
-                if param.requires_grad and param.dtype in [
-                    torch.float16,
-                    torch.float32,
-                    torch.bfloat16,
-                ]:
-                    param_float = param.float()
-                    l2_reg = l2_reg + torch.norm(param_float, p=2).to(loss.dtype)
-
-            loss = loss + l2_lambda * l2_reg
-
-        return (loss, outputs) if return_outputs else loss
-
-
-def prepare_dataset(data_path: str, tokenizer, config: TrainingConfig):
+def prepare_dataset(data_path: str, tokenizer, config: OptimizedConfig):
     dataset = load_dataset("json", data_files=data_path, split="train")
 
     def format_instruction(example: Dict[str, Any]) -> Dict[str, Any]:
@@ -295,149 +115,142 @@ def prepare_dataset(data_path: str, tokenizer, config: TrainingConfig):
             return {
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
-                "labels": input_ids.copy(),  # Use copy to avoid reference issues
+                "labels": input_ids.copy(),
             }
         except Exception as e:
             print(f"Error processing example: {str(e)}")
-            return {
-                "input_ids": [0] * config.sequence_length,
-                "attention_mask": [0] * config.sequence_length,
-                "labels": [-100] * config.sequence_length,
-            }
+            return None
 
     processed_dataset = dataset.map(
         format_instruction,
         remove_columns=dataset.column_names,
-        num_proc=4 if config.is_production else 2,
+        num_proc=2,
         desc="Formatting dataset",
-        load_from_cache_file=not config.is_production,
     )
 
     def validate_example(example):
-        try:
-            required_keys = {"input_ids", "attention_mask", "labels"}
-            if not all(k in example for k in required_keys):
-                return False
-            lengths = {len(example[k]) for k in required_keys}
-            if len(lengths) != 1 or 0 in lengths:
-                return False
-            if sum(example["attention_mask"]) == 0:
-                return False
-            return True
-        except Exception:
+        if example is None:
             return False
+        required_keys = {"input_ids", "attention_mask", "labels"}
+        if not all(k in example for k in required_keys):
+            return False
+        lengths = {len(example[k]) for k in required_keys}
+        if len(lengths) != 1 or 0 in lengths:
+            return False
+        if sum(example["attention_mask"]) == 0:
+            return False
+        return True
 
     filtered_dataset = processed_dataset.filter(
         validate_example,
         num_proc=1,
         desc="Validating examples",
     )
-    total_examples = len(dataset)
-    filtered_examples = len(filtered_dataset)
-    print(f"Dataset processing complete:")
-    print(f"  - Total examples: {total_examples}")
-    print(f"  - Valid examples: {filtered_examples}")
-    print(f"  - Filtered out: {total_examples - filtered_examples} examples")
-    if filtered_examples == 0:
-        raise ValueError("No valid examples remained after filtering!")
-    return filtered_dataset
 
-    def validate_example(example):
-        if example is None:
-            return False
+    train_test = filtered_dataset.train_test_split(test_size=0.1)
 
-        if len(example["input_ids"]) < 10:
-            return False
-
-        if len(example["input_ids"]) > config.sequence_length:
-            return False
-
-        if len(example["input_ids"]) != len(example["attention_mask"]):
-            return False
-
-        return True
-
-    filtered_dataset = processed_dataset.filter(
-        validate_example, num_proc=num_proc, desc="Validating examples"
-    )
-
-    total_examples = len(dataset)
-    filtered_examples = len(filtered_dataset)
-    print(f"Dataset processing complete:")
-    print(f"  - Total examples: {total_examples}")
-    print(f"  - Valid examples: {filtered_examples}")
-    print(f"  - Filtered out: {total_examples - filtered_examples} examples")
-
-    return filtered_dataset
+    return train_test
 
 
-def train_model(data_path: str, model_name: str):
-    hardware = detect_hardware()
-    config = TrainingConfig(hardware)
-
-    print(
-        f"Training on {hardware.device_name} with {hardware.total_memory:.1f}GB memory"
-    )
-    print(f"Production mode: {config.is_production}")
+def setup_optimized_model(model_name: str):
+    config = OptimizedConfig()
 
     tokenizer = AutoTokenizer.from_pretrained(
-        model_name, trust_remote_code=True, padding_side="right"
+        model_name,
+        model_max_length=config.sequence_length,
+        padding_side="right",
+        trust_remote_code=True,
     )
 
-    dataset = prepare_dataset(data_path, tokenizer, config)
-    train_test_split = dataset.train_test_split(test_size=0.1, seed=42)
+    quantization_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+    )
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        quantization_config=config.quantization_config,
+        torch_dtype=torch.float16,
+        quantization_config=quantization_config,
         device_map="auto",
-        trust_remote_code=True,
-        torch_dtype=torch.bfloat16 if config.is_production else torch.float16,
     )
 
-    model.gradient_checkpointing_enable()
-
-    model = setup_peft_model(model, config)
-    training_args = TrainingArguments(**config.training_args)
-
-    wandb.init(
-        project="query-translator-mini",
-        name=f"{'prod' if config.is_production else 'dev'}-{wandb.util.generate_id()}",
-        config={
-            "model_name": model_name,
-            "hardware": hardware.device_name,
-            "memory_gb": hardware.total_memory,
-            "is_production": config.is_production,
-            **config.training_args,
-        },
+    peft_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=False,
+        r=config.lora_r,
+        lora_alpha=config.lora_alpha,
+        lora_dropout=config.lora_dropout,
+        target_modules=[
+            "self_attn.q_proj",
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+            "self_attn.o_proj",
+            "mlp.gate_proj",
+            "mlp.up_proj",
+            "mlp.down_proj",
+        ],
+        bias="none",
+        modules_to_save=["embed_tokens", "lm_head"],
     )
 
-    data_collator = DataCollatorForLanguageModeling(
-        tokenizer=tokenizer,
-        mlm=False,
-        pad_to_multiple_of=8 if config.is_production else 4,
+    model = prepare_model_for_kbit_training(model)
+    model = get_peft_model(model, peft_config)
+
+    return model, tokenizer, config
+
+
+def prepare_training_args(config: OptimizedConfig):
+    return TrainingArguments(
+        output_dir="./query-translator-mini",
+        num_train_epochs=config.num_train_epochs,
+        per_device_train_batch_size=config.batch_size,
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
+        learning_rate=config.learning_rate,
+        fp16=True,
+        optim="adamw_torch_fused",
+        warmup_ratio=config.warmup_ratio,
+        evaluation_strategy="steps",
+        eval_steps=10,
+        save_strategy="steps",
+        save_steps=10,
+        gradient_checkpointing=True,
+        load_best_model_at_end=True,
+        max_steps=500,
     )
 
-    trainer = CustomTrainer(
+
+def optimize_for_inference(model):
+    model.half()  # Convert to FP16
+    model.eval()
+    with torch.no_grad():
+        for param in model.parameters():
+            param.requires_grad = False
+    return model
+
+
+def train():
+    model_name = "Qwen/Qwen2.5-7B"
+    data_path = "synthetic_data.jsonl"
+
+    model, tokenizer, config = setup_optimized_model(model_name)
+    dataset = prepare_dataset(data_path, tokenizer, config)
+    training_args = prepare_training_args(config)
+
+    trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=train_test_split["train"],
-        eval_dataset=train_test_split["test"],
-        data_collator=data_collator,
+        train_dataset=dataset["train"],
+        eval_dataset=dataset["test"],
+        data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False),
     )
 
     trainer.train()
 
-    save_kwargs = {
-        "max_shard_size": "500MB" if config.is_production else "2GB",
-        "safe_serialization": True,
-    }
-
-    prune_model(model, threshold=0.1)
-    model.save_pretrained("final_model_pruned", **save_kwargs)
+    model = optimize_for_inference(model)
+    model.save_pretrained("query-translator-mini-optimized", max_shard_size="2GB")
 
 
 if __name__ == "__main__":
-    model_name = "Qwen/Qwen2.5-7B"
-    data_path = "./synthetic_data.jsonl"
-    train_model(data_path, model_name)
+    train()
