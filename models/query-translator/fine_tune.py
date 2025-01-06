@@ -4,9 +4,9 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     TrainingArguments,
-    DataCollatorForLanguageModeling,
     Trainer,
     BitsAndBytesConfig,
+    DataCollatorForLanguageModeling,
 )
 from peft import (
     LoraConfig,
@@ -14,9 +14,8 @@ from peft import (
     prepare_model_for_kbit_training,
     TaskType,
 )
-import torch
 from dataclasses import dataclass
-import json
+import torch, json, yaml
 
 SYSTEM_PROMPT = """
 You are a tool used to generate synthetic data of Orama queries. Orama is a full-text, vector, and hybrid search engine.
@@ -56,6 +55,38 @@ The rules to generate the query are:
 
 
 @dataclass
+class Config:
+    def __init__(self, config_path: str):
+        with open(config_path) as f:
+            config = yaml.safe_load(f)
+
+        self.model_name = config["model"]["name"]
+        self.sequence_length = config["model"]["sequence_length"]
+        self.batch_size = config["model"]["batch_size"]
+        self.gradient_accumulation_steps = config["model"][
+            "gradient_accumulation_steps"
+        ]
+
+        self.lora_r = config["lora"]["r"]
+        self.lora_alpha = config["lora"]["alpha"]
+        self.lora_dropout = config["lora"]["dropout"]
+        self.target_modules = config["lora"]["target_modules"]
+        self.modules_to_save = config["lora"]["modules_to_save"]
+
+        self.learning_rate = config["training"]["learning_rate"]
+        self.num_train_epochs = config["training"]["num_epochs"]
+        self.warmup_ratio = config["training"]["warmup_ratio"]
+        self.eval_steps = config["training"]["eval_steps"]
+        self.save_steps = config["training"]["save_steps"]
+        self.max_steps = config["training"]["max_steps"]
+        self.output_dir = config["training"]["output_dir"]
+
+        self.data_path = config["data"]["path"]
+        self.test_size = config["data"]["test_size"]
+        self.num_proc = config["data"]["num_proc"]
+
+
+@dataclass
 class OptimizedConfig:
     sequence_length: int = 512
     batch_size: int = 4
@@ -68,26 +99,15 @@ class OptimizedConfig:
     warmup_ratio: float = 0.05
 
 
-def prepare_dataset(data_path: str, tokenizer, config: OptimizedConfig):
+def prepare_dataset(data_path: str, tokenizer, config: Config):
     dataset = load_dataset("json", data_files=data_path, split="train")
 
     def format_instruction(example: Dict[str, Any]) -> Dict[str, Any]:
         try:
-            query = example.get("query", "").strip()
-            if not query:
-                return {"input_ids": [], "attention_mask": [], "labels": []}
-            schema = example.get("schema", "{}")
-            if isinstance(schema, str):
-                try:
-                    schema = json.loads(schema)
-                except json.JSONDecodeError:
-                    schema = {}
-            generated_query = example.get("generatedQuery", "{}")
-            if isinstance(generated_query, str):
-                try:
-                    generated_query = json.loads(generated_query)
-                except json.JSONDecodeError:
-                    generated_query = {}
+            query = example["query"].strip()
+            schema = json.loads(example["schema"])
+            generated_query = json.loads(example["generatedQuery"])
+
             messages = [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {
@@ -96,6 +116,7 @@ def prepare_dataset(data_path: str, tokenizer, config: OptimizedConfig):
                 },
                 {"role": "assistant", "content": json.dumps(generated_query)},
             ]
+
             formatted_text = tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
             )
@@ -106,40 +127,45 @@ def prepare_dataset(data_path: str, tokenizer, config: OptimizedConfig):
                 padding="max_length",
                 return_tensors="pt",
             )
+
             input_ids = tokenized["input_ids"].squeeze().tolist()
             attention_mask = tokenized["attention_mask"].squeeze().tolist()
-            if not isinstance(input_ids, list):
-                input_ids = [input_ids]
-            if not isinstance(attention_mask, list):
-                attention_mask = [attention_mask]
+
             return {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "labels": input_ids.copy(),
+                "input_ids": input_ids if isinstance(input_ids, list) else [input_ids],
+                "attention_mask": (
+                    attention_mask
+                    if isinstance(attention_mask, list)
+                    else [attention_mask]
+                ),
+                "labels": (
+                    input_ids.copy() if isinstance(input_ids, list) else [input_ids]
+                ),
             }
         except Exception as e:
             print(f"Error processing example: {str(e)}")
-            return None
+            return {
+                "input_ids": [0] * config.sequence_length,
+                "attention_mask": [0] * config.sequence_length,
+                "labels": [-100] * config.sequence_length,
+            }
 
     processed_dataset = dataset.map(
         format_instruction,
         remove_columns=dataset.column_names,
-        num_proc=2,
+        num_proc=config.num_proc,
         desc="Formatting dataset",
     )
 
     def validate_example(example):
-        if example is None:
+        if not example:
             return False
         required_keys = {"input_ids", "attention_mask", "labels"}
-        if not all(k in example for k in required_keys):
-            return False
-        lengths = {len(example[k]) for k in required_keys}
-        if len(lengths) != 1 or 0 in lengths:
-            return False
-        if sum(example["attention_mask"]) == 0:
-            return False
-        return True
+        return (
+            all(k in example for k in required_keys)
+            and len(set(len(example[k]) for k in required_keys)) == 1
+            and sum(example["attention_mask"]) > 0
+        )
 
     filtered_dataset = processed_dataset.filter(
         validate_example,
@@ -147,16 +173,12 @@ def prepare_dataset(data_path: str, tokenizer, config: OptimizedConfig):
         desc="Validating examples",
     )
 
-    train_test = filtered_dataset.train_test_split(test_size=0.1)
-
-    return train_test
+    return filtered_dataset.train_test_split(test_size=config.test_size)
 
 
-def setup_optimized_model(model_name: str):
-    config = OptimizedConfig()
-
+def setup_model(config: Config):
     tokenizer = AutoTokenizer.from_pretrained(
-        model_name,
+        config.model_name,
         model_max_length=config.sequence_length,
         padding_side="right",
         trust_remote_code=True,
@@ -170,7 +192,7 @@ def setup_optimized_model(model_name: str):
     )
 
     model = AutoModelForCausalLM.from_pretrained(
-        model_name,
+        config.model_name,
         torch_dtype=torch.float16,
         quantization_config=quantization_config,
         device_map="auto",
@@ -182,47 +204,39 @@ def setup_optimized_model(model_name: str):
         r=config.lora_r,
         lora_alpha=config.lora_alpha,
         lora_dropout=config.lora_dropout,
-        target_modules=[
-            "self_attn.q_proj",
-            "self_attn.k_proj",
-            "self_attn.v_proj",
-            "self_attn.o_proj",
-            "mlp.gate_proj",
-            "mlp.up_proj",
-            "mlp.down_proj",
-        ],
+        target_modules=config.target_modules,
         bias="none",
-        modules_to_save=["embed_tokens", "lm_head"],
+        modules_to_save=config.modules_to_save,
     )
 
     model = prepare_model_for_kbit_training(model)
     model = get_peft_model(model, peft_config)
 
-    return model, tokenizer, config
+    return model, tokenizer
 
 
-def prepare_training_args(config: OptimizedConfig):
+def prepare_training_args(config: Config):
     return TrainingArguments(
-        output_dir="./query-translator-mini",
-        num_train_epochs=config.num_train_epochs,
+        output_dir=config.output_dir,
+        num_train_epochs=float(config.num_train_epochs),
         per_device_train_batch_size=config.batch_size,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
-        learning_rate=config.learning_rate,
+        learning_rate=float(config.learning_rate),
         fp16=True,
         optim="adamw_torch_fused",
-        warmup_ratio=config.warmup_ratio,
-        evaluation_strategy="steps",
-        eval_steps=10,
+        warmup_ratio=float(config.warmup_ratio),
+        eval_strategy="steps",
+        eval_steps=config.eval_steps,
         save_strategy="steps",
-        save_steps=10,
+        save_steps=config.save_steps,
         gradient_checkpointing=True,
         load_best_model_at_end=True,
-        max_steps=500,
+        max_steps=config.max_steps,
     )
 
 
 def optimize_for_inference(model):
-    model.half()  # Convert to FP16
+    model.half()
     model.eval()
     with torch.no_grad():
         for param in model.parameters():
@@ -231,11 +245,9 @@ def optimize_for_inference(model):
 
 
 def train():
-    model_name = "Qwen/Qwen2.5-7B"
-    data_path = "synthetic_data.jsonl"
-
-    model, tokenizer, config = setup_optimized_model(model_name)
-    dataset = prepare_dataset(data_path, tokenizer, config)
+    config = Config("config.yaml")
+    model, tokenizer = setup_model(config)
+    dataset = prepare_dataset(config.data_path, tokenizer, config)
     training_args = prepare_training_args(config)
 
     trainer = Trainer(
@@ -247,7 +259,6 @@ def train():
     )
 
     trainer.train()
-
     model = optimize_for_inference(model)
     model.save_pretrained("query-translator-mini-optimized", max_shard_size="2GB")
 

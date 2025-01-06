@@ -1,0 +1,35 @@
+model:
+  name: "Qwen/Qwen2.5-7B"
+  sequence_length: 512
+  batch_size: 4
+  gradient_accumulation_steps: 4
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.1
+  target_modules:
+    - "self_attn.q_proj"
+    - "self_attn.k_proj"
+    - "self_attn.v_proj"
+    - "self_attn.o_proj"
+    - "mlp.gate_proj"
+    - "mlp.up_proj"
+    - "mlp.down_proj"
+  modules_to_save:
+    - "embed_tokens"
+    - "lm_head"
+
+training:
+  learning_rate: 3e-4
+  num_epochs: 1
+  warmup_ratio: 0.05
+  eval_steps: 10
+  save_steps: 10
+  max_steps: 500
+  output_dir: "./query-translator-mini"
+
+data:
+  path: "./synthetic_data.jsonl"
+  test_size: 0.1
+  num_proc: 2

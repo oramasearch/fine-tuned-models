@@ -12,3 +12,4 @@ sentencepiece
 peft
 bitsandbytes
 huggingface_hub
+PyYAML
