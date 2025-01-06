@@ -238,9 +238,10 @@ def prepare_training_args(config: Config):
     )
 
 
-def _save_checkpoint(trainer, output_dir):
+def _save_checkpoint(trainer, model, trial):
+    output_dir = trainer.args.output_dir
     trainer.model.save_pretrained(output_dir, max_shard_size="2GB")
-    if trainer.tokenizer is not None:
+    if trainer.tokenizer:
         trainer.tokenizer.save_pretrained(output_dir)
     torch.save(
         trainer.optimizer.state_dict(),
