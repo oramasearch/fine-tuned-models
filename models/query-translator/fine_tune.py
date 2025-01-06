@@ -393,8 +393,9 @@ def train_model(data_path: str, model_name: str):
         device_map="auto",
         trust_remote_code=True,
         torch_dtype=torch.bfloat16 if config.is_production else torch.float16,
-        use_gradient_checkpointing=True,
     )
+
+    model.gradient_checkpointing_enable()
 
     model = setup_peft_model(model, config)
     training_args = TrainingArguments(**config.training_args)
