@@ -6,14 +6,14 @@ This is a collection of fine-tuned models used by Orama.
 
 The models in this repository have been trained with `python3.12`. Therefore, we recommend using a venv with that specific Python version.
 
-```shell
-$ python3.12 -m venv .venv
-$ source .venv/bin/activate
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
 ```
 
 Then install all the dependencies:
 
-```shell
+```bash
 pip install -r requirements.txt
 ```
 
