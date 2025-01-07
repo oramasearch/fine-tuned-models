@@ -50,7 +50,7 @@ def update_model(adapter_path: str, repo_name: str, token: str):
 
 
 if __name__ == "__main__":
-    ADAPTER_PATH = "./query-translator-mini"
+    ADAPTER_PATH = "./query-translator-mini-optimized"
     REPO_NAME = "OramaSearch/query-translator-mini"
 
     try:
