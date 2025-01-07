@@ -230,7 +230,7 @@ def prepare_training_args(config: Config):
         eval_strategy="steps",
         eval_steps=config.eval_steps,
         save_strategy="steps",
-        save_steps=50,
+        save_steps=config.eval_steps,
         gradient_checkpointing=True,
         load_best_model_at_end=True,
         max_steps=config.max_steps,
