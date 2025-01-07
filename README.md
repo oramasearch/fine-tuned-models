@@ -26,6 +26,10 @@ cd models/query-translator
 OLLAMA_URL=http://localhost:11434 python synthetic.py
 ```
 
+## Models
+
+- **Query Translator Mini**: [HuggingFace](https://huggingface.co/OramaSearch/query-translator-mini)
+
 ## License
 
 [AGPLv3](/LICENSE.md)
